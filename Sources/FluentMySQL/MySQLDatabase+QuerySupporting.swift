@@ -1,126 +1,121 @@
-import Async
-import FluentSQL
-import Foundation
+extension MySQLDatabase: QuerySupporting {
+    /// See `QuerySupporting`.
+    public typealias Query = FluentMySQLQuery
+    
+    /// See `QuerySupporting`.
+    public typealias Output = [MySQLColumn: MySQLData]
+    
+    /// See `QuerySupporting`.
+    public typealias QueryAction = FluentMySQLQueryStatement
+    
+    /// See `QuerySupporting`.
+    public typealias QueryAggregate = String
+    
+    /// See `QuerySupporting`.
+    public typealias QueryData = [String: MySQLExpression]
+    
+    /// See `QuerySupporting`.
+    public typealias QueryField = MySQLColumnIdentifier
+    
+    /// See `QuerySupporting`.
+    public typealias QueryFilterMethod = MySQLBinaryOperator
+    
+    /// See `QuerySupporting`.
+    public typealias QueryFilterValue = MySQLExpression
+    
+    /// See `QuerySupporting`.
+    public typealias QueryFilter = MySQLExpression
+    
+    /// See `QuerySupporting`.
+    public typealias QueryFilterRelation = MySQLBinaryOperator
+    
+    /// See `QuerySupporting`.
+    public typealias QueryKey = MySQLSelectExpression
+    
+    /// See `QuerySupporting`.
+    public typealias QuerySort = MySQLOrderBy
+    
+    /// See `QuerySupporting`.
+    public typealias QuerySortDirection = MySQLDirection
 
-/// Adds ability to do basic Fluent queries using a `MySQLDatabase`.
-extension MySQLDatabase: QuerySupporting, CustomSQLSupporting {
-    /// See `QuerySupporting.QueryData`
-    public typealias QueryData = MySQLData
-
-    /// See `QuerySupporting.QueryDataConvertible`
-    public typealias QueryDataConvertible = MySQLDataConvertible
-
-    /// See `QuerySupporting.execute`
-    public static func execute(
-        query: DatabaseQuery<MySQLDatabase>,
-        into handler: @escaping ([QueryField: MySQLData], MySQLConnection) throws -> (),
-        on connection: MySQLConnection
-    ) -> EventLoopFuture<Void> {
-        return Future<Void>.flatMap(on: connection) {
-            // Convert Fluent `DatabaseQuery` to generic FluentSQL `DataQuery`
-            var (sqlQuery, bindValues) = query.makeDataQuery()
-            let params: [MySQLDatabase.QueryData]
-
-            switch sqlQuery {
-            case .manipulation(var manipulation):
-                // If the query has an Encodable model attached serialize it.
-                // Dictionary keys should be added to the DataQuery as columns.
-                // Dictionary values should be added to the parameterized array.
-                var modelData: [MySQLData] = []
-                modelData.reserveCapacity(query.data.count)
-                manipulation.columns = query.data.map { (field, data) in
-                    modelData.append(data)
-                    let col = DataColumn(table: field.entity, name: field.name)
-                    return .init(column: col, value: .placeholder)
+    /// See `QuerySupporting`.
+    public static func queryExecute(_ fluent: FluentMySQLQuery, on conn: MySQLConnection, into handler: @escaping ([MySQLColumn : MySQLData], MySQLConnection) throws -> ()) -> Future<Void> {
+        let query: MySQLQuery
+        switch fluent.statement {
+        case ._insert:
+            var insert: MySQLInsert = .insert(fluent.table)
+            var values: [MySQLExpression] = []
+            fluent.values.forEach { row in
+                // filter out all `NULL` values, no need to insert them since
+                // they could override default values that we want to keep
+                switch row.value {
+                case ._literal(let literal):
+                    switch literal {
+                    case ._null: return
+                    default: break
+                    }
+                default: break
                 }
-                params = modelData + bindValues
-                sqlQuery = .manipulation(manipulation)
-            case .query(let data):
-                params = bindValues
-                sqlQuery = .query(data)
-            case .definition:
-                params = []
+                insert.columns.append(.column(nil, .identifier(row.key)))
+                values.append(row.value)
             }
-
-            /// Apply custom sql transformations
-            for customSQL in query.customSQL {
-                customSQL.closure(&sqlQuery)
+            insert.values.append(values)
+            insert.ignore = fluent.ignore
+            insert.upsert = fluent.upsert
+            query = .insert(insert)
+        case ._select:
+            var select: MySQLSelect = .select()
+            select.columns = fluent.keys.isEmpty ? [.all] : fluent.keys
+            select.tables = [fluent.table]
+            select.joins = fluent.joins
+            select.predicate = fluent.predicate
+            select.orderBy = fluent.orderBy
+            select.groupBy = fluent.groupBy
+            select.limit = fluent.limit
+            select.offset = fluent.offset
+            query = .select(select)
+        case ._update:
+            var update: MySQLUpdate = .update(fluent.table)
+            update.table = fluent.table
+            update.values = fluent.values.map { val in
+                return (.identifier(val.key), val.value)
             }
-
-            // Create a MySQL-flavored SQL serializer to create a SQL string
-            let sqlSerializer = MySQLSerializer()
-            let sqlString = sqlSerializer.serialize(sqlQuery)
-
-            /// Log supporting
-            if let logger = connection.logger {
-                logger.record(query: sqlString, values: params.map { $0.description })
-            }
-
-            /// Run the query
-            return connection.query(sqlString,params) { row in
-                var res: [QueryField: MySQLData] = [:]
-                for (col, data) in row {
-                    let field = QueryField(entity: col.table, name: col.name)
-                    res[field] = data
-                }
-                try handler(res, connection)
-            }
+            update.predicate = fluent.predicate
+            query = .update(update)
+        case ._delete:
+            var delete: MySQLDelete = .delete(fluent.table)
+            delete.predicate = fluent.predicate
+            query = .delete(delete)
         }
+        return conn.query(query) { try handler($0, conn) }
     }
 
-    /// See `QuerySupporting.modelEvent`
-    public static func modelEvent<M>(event: ModelEvent, model: M, on connection: MySQLConnection) -> Future<M>
-        where MySQLDatabase == M.Database, M: Model
-    {
+    /// See `QuerySupporting`.
+    public static func modelEvent<M>(event: ModelEvent, model: M, on conn: MySQLConnection) -> EventLoopFuture<M> where MySQLDatabase == M.Database, M : Model {
+        var copy = model
         switch event {
         case .willCreate:
-            if M.ID.self == UUID.self, model.fluentID == nil {
-                var model = model
-                model.fluentID = UUID() as? M.ID
-                return Future.map(on: connection) { model }
+            if M.ID.self is UUID.Type, model.fluentID == nil {
+                copy.fluentID = UUID() as? M.ID
             }
         case .didCreate:
-            // only use last_id if the model's current ID is nil, otherwise keep it
-            if model.fluentID == nil, M.ID.self == Int.self {
-                return connection.simpleQuery("SELECT LAST_INSERT_ID() AS lastval;").map(to: M.self) { row in
-                    var model = model
-                    try model.fluentID = row[0].firstValue(forColumn: "lastval")?.decode(Int.self) as? M.ID
-                    return model
-                }
+            if let idType = M.ID.self as? UInt64Initializable.Type, copy.fluentID == nil {
+                // FIXME: support other Int types
+                copy.fluentID = conn.lastMetadata?.lastInsertID.flatMap(idType.init) as? M.ID
             }
         default: break
         }
-
-        return Future.map(on: connection) { model }
+        return conn.future(copy)
     }
-
-    /// See `QuerySupporting.queryDataParse(_:from:)`
-    public static func queryDataParse<T>(_ type: T.Type, from data: MySQLData) throws -> T? {
-        if data.isNull {
-            return nil
-        }
-
-        guard let convertibleType = T.self as? MySQLDataConvertible.Type else {
-            throw MySQLError(identifier: "queryDataParse", reason: "Cannot parse \(T.self) from MySQLData", source: .capture())
-        }
-        let t: T = try convertibleType.convertFromMySQLData(data) as! T
-        return t
-    }
-
-    /// See `QuerySupporting.queryDataSerialize(data:)`
-    public static func queryDataSerialize<T>(data: T?) throws -> MySQLData {
-        if let data = data {
-            guard let convertible = data as? MySQLDataConvertible else {
-                throw MySQLError(identifier: "queryDataSerialize", reason: "Cannot serialize \(T.self) to MySQLData", source: .capture())
-            }
-            return try convertible.convertToMySQLData()
-        } else {
-            return MySQLData.null
-        }
-    }
-
-    /// See `QuerySupporting.QueryFilter`
-    public typealias QueryFilter = DataPredicateComparison
 }
 
-extension MySQLData: FluentData { }
+internal protocol UInt64Initializable {
+    init(_ uint64: UInt64)
+}
+
+extension Int: UInt64Initializable { }
+extension Int32: UInt64Initializable { }
+extension Int64: UInt64Initializable { }
+extension UInt32: UInt64Initializable { }
+extension UInt64: UInt64Initializable { }
+extension UInt: UInt64Initializable { }

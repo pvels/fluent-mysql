@@ -1,34 +1,6 @@
 /// A MySQL type can represent itself statically as a column definition for
 /// migrations and convert to / from native MySQL data.
-public typealias MySQLType = MySQLColumnDefinitionStaticRepresentable & MySQLDataConvertible
-
-/// A MySQL type that is represented by JSON in the database.
-public protocol MySQLJSONType: MySQLType, Codable { }
-
-extension MySQLJSONType {
-    /// An appropriate `MySQLColumnDefinition` for this type.
-    public static var mySQLColumnDefinition: MySQLColumnDefinition { return .json() }
-
-    /// See `MySQLDataConvertible.convertToMySQLData(format:)`
-    public func convertToMySQLData() throws -> MySQLData {
-        return try MySQLData(json: self)
-    }
-
-    /// See `MySQLDataConvertible.convertFromMySQLData()`
-    public static func convertFromMySQLData(_ mysqlData: MySQLData) throws -> Self {
-        guard let json = try mysqlData.json(Self.self) else {
-            throw MySQLError(identifier: "json", reason: "Could not parse JSON from: \(self)", source: .capture())
-        }
-        return json
-    }
-}
-
-extension MySQLText: MySQLColumnDefinitionStaticRepresentable {
-    /// See `MySQLColumnDefinitionStaticRepresentable`
-    public static var mySQLColumnDefinition: MySQLColumnDefinition {
-        return .text()
-    }
-}
+public typealias MySQLType = MySQLDataTypeStaticRepresentable & MySQLDataConvertible
 
 // MARK: Enum
 /// This type-alias makes it easy to declare nested enum types for your `MySQLModel`.
@@ -54,9 +26,11 @@ public protocol MySQLEnumType: MySQLType, ReflectionDecodable, Codable, RawRepre
 
 /// Provides a default `MySQLColumnDefinitionStaticRepresentable` implementation where the type is also
 /// `RawRepresentable` by a `MySQLColumnDefinitionStaticRepresentable` type.
-extension MySQLColumnDefinitionStaticRepresentable where Self: RawRepresentable, Self.RawValue: MySQLColumnDefinitionStaticRepresentable
+extension MySQLDataTypeStaticRepresentable where Self: RawRepresentable, Self.RawValue: MySQLDataTypeStaticRepresentable
 {
-    public static var mySQLColumnDefinition: MySQLColumnDefinition { return RawValue.mySQLColumnDefinition }
+    public static var mysqlDataType: MySQLDataType {
+        return RawValue.mysqlDataType
+    }
 }
 
 /// Provides a default `MySQLDataConvertible` implementation where the type is also
@@ -64,18 +38,14 @@ extension MySQLColumnDefinitionStaticRepresentable where Self: RawRepresentable,
 extension MySQLDataConvertible where Self: RawRepresentable, Self.RawValue: MySQLDataConvertible
 {
     /// See `MySQLDataConvertible.convertToMySQLData()`
-    public func convertToMySQLData() throws -> MySQLData {
-        return try rawValue.convertToMySQLData()
+    public func convertToMySQLData() -> MySQLData {
+        return rawValue.convertToMySQLData()
     }
 
     /// See `MySQLDataConvertible.convertFromMySQLData(_:)`
     public static func convertFromMySQLData(_ data: MySQLData) throws -> Self {
         guard let extractedCase = try self.init(rawValue: .convertFromMySQLData(data)) else {
-            throw MySQLError(
-                identifier: "rawValue",
-                reason: "Could not create `\(Self.self)` from: \(data)",
-                source: .capture()
-            )
+            throw MySQLError(identifier: "rawValue", reason: "Could not create `\(Self.self)` from: \(data)")
         }
         return extractedCase
     }

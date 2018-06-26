@@ -1,133 +1,95 @@
-import Async
 import Crypto
-import Foundation
 
-/// Adds ability to create, update, and delete schemas using a `MySQLDatabase`.
-extension MySQLDatabase: SchemaSupporting, IndexSupporting {
-    /// See `SchemaSupporting.dataType`
-    public static func dataType(for field: SchemaField<MySQLDatabase>) -> String {
-        var string = field.type.name
-
-        if let length = field.type.length {
-            string += "(\(length))"
+extension MySQLDatabase: SQLConstraintIdentifierNormalizer {
+    public static func normalizeSQLConstraintIdentifier(_ identifier: String) -> String {
+        do {
+            return try SHA1.hash(identifier).hexEncodedString()
+        } catch {
+            print("[ERROR] [MySQL] Could not hash MySQL constraint identifier: \(error).")
+            return identifier
         }
-
-        string += " " + field.type.attributes.joined(separator: " ")
-
-        if field.isIdentifier {
-            string += " PRIMARY KEY"
-            if field.type.name.contains("INT") {
-                string += " AUTO_INCREMENT"
-            }
-        }
-
-        if !field.isOptional {
-            string += " NOT NULL"
-        }
-
-        return string
     }
+}
 
-    /// See `SchemaSupporting.fieldType`
-    public static func fieldType(for type: Any.Type) throws -> MySQLColumnDefinition {
-        if let representable = type as? MySQLColumnDefinitionStaticRepresentable.Type {
-            return representable.mySQLColumnDefinition
+extension MySQLDatabase: SchemaSupporting {
+    /// See `SchemaSupporting`.
+    public typealias Schema = FluentMySQLSchema
+    
+    /// See `SchemaSupporting`.
+    public typealias SchemaAction = FluentMySQLSchemaStatement
+    
+    /// See `SchemaSupporting`.
+    public typealias SchemaField = MySQLColumnDefinition
+    
+    /// See `SchemaSupporting`.
+    public typealias SchemaFieldType = MySQLDataType
+    
+    /// See `SchemaSupporting`.
+    public typealias SchemaConstraint = MySQLTableConstraint
+    
+    /// See `SchemaSupporting`.
+    public typealias SchemaReferenceAction = MySQLForeignKeyAction
+    
+    /// See `SchemaSupporting`.
+    public static func schemaField(for type: Any.Type, isIdentifier: Bool, _ field: MySQLColumnIdentifier) -> MySQLColumnDefinition {
+        var type = type
+        var constraints: [MySQLColumnConstraint] = []
+        
+        if let optional = type as? AnyOptionalType.Type {
+            type = optional.anyWrappedType
         } else {
-            throw MySQLError(
-                identifier: "fieldType",
-                reason: "No MySQL column type known for \(type).",
-                suggestedFixes: [
-                    "Conform \(type) to `MySQLColumnDefinitionStaticRepresentable` to specify field type or implement a custom migration.",
-                    "Specify the `MySQLColumnDefinition` manually using the schema builder in a migration."
-                ],
-                source: .capture()
-            )
+            constraints.append(.notNull)
         }
-    }
-
-    /// See `SchemaSupporting.execute`
-    public static func execute(schema: DatabaseSchema<MySQLDatabase>, on connection: MySQLConnection) -> Future<Void> {
-        return Future.flatMap(on: connection) {
-            var schemaQuery = schema.makeSchemaQuery(dataTypeFactory: dataType)
-            schema.applyReferences(to: &schemaQuery)
-            try schemaQuery.addForeignKeys.mysqlShortenNames()
-            try schemaQuery.removeForeignKeys.mysqlShortenNames()
-
-
-            /// Apply custom sql transformations
-            var sqlQuery: SQLQuery = .definition(schemaQuery)
-            for customSQL in schema.customSQL {
-                customSQL.closure(&sqlQuery)
-            }
-
-            let sqlString = MySQLSerializer().serialize(sqlQuery)
-            if let logger = connection.logger {
-                logger.log(query: sqlString)
-            }
-            return connection.simpleQuery(sqlString).map(to: Void.self) { rows in
-                assert(rows.count == 0)
-            }.flatMap(to: Void.self) {
-                /// handle indexes as separate query
-                var indexFutures: [Future<Void>] = []
-                for addIndex in schema.addIndexes {
-                    let fields = addIndex.fields.map { "`\($0.name)`" }.joined(separator: ", ")
-                    let name = try addIndex.mysqlIdentifier(for: schema.entity).mysqlShortenedName()
-                    let add = connection.simpleQuery("CREATE \(addIndex.isUnique ? "UNIQUE " : "")INDEX `\(name)` ON `\(schema.entity)` (\(fields))").map(to: Void.self) { rows in
-                        assert(rows.count == 0)
-                    }
-                    indexFutures.append(add)
-                }
-                for removeIndex in schema.removeIndexes {
-                    let name = try removeIndex.mysqlIdentifier(for: schema.entity).mysqlShortenedName()
-                    let remove = connection.simpleQuery("DROP INDEX `\(name)`").map(to: Void.self) { rows in
-                        assert(rows.count == 0)
-                    }
-                    indexFutures.append(remove)
-                }
-                return indexFutures.flatten(on: connection)
+        
+        let typeName: MySQLDataType
+        if let mysql = type as? MySQLDataTypeStaticRepresentable.Type {
+            typeName = mysql.mysqlDataType
+        } else {
+            typeName = .json
+        }
+        
+        if isIdentifier {
+            constraints.append(.notNull)
+            switch typeName {
+            case .tinyint, .smallint, .int, .bigint:
+                constraints.append(.primaryKey(default: .autoIncrement))
+            default:
+                constraints.append(.primaryKey(default: nil))
             }
         }
+        
+        return .columnDefinition(field, typeName, constraints)
     }
-}
-
-// MARK: Utilities
-
-extension String {
-    func mysqlShortenedName() throws -> String {
-        return try "_fluent_" + MD5.hash(self).base64URLEncodedString()
-    }
-}
-
-extension String {
-    mutating func mysqlShortenName() throws {
-        self = try mysqlShortenedName()
-    }
-}
-
-extension DataDefinitionForeignKey {
-    mutating func mysqlShortenName() throws {
-        try name.mysqlShortenName()
-    }
-}
-
-extension Array where Element == DataDefinitionForeignKey {
-    mutating func mysqlShortenNames() throws {
-        for i in 0..<count {
-            try self[i].mysqlShortenName()
+    
+    /// See `SchemaSupporting`.
+    public static func schemaExecute(_ fluent: FluentMySQLSchema, on conn: MySQLConnection) -> Future<Void> {
+        let query: MySQLQuery
+        switch fluent.statement {
+        case ._createTable:
+            var createTable: MySQLCreateTable = .createTable(fluent.table)
+            createTable.columns = fluent.columns
+            createTable.tableConstraints = fluent.constraints
+            query = ._createTable(createTable)
+        case ._alterTable:
+            var alterTable: MySQLAlterTable = .alterTable(fluent.table)
+            alterTable.columns = fluent.columns
+            alterTable.constraints = fluent.constraints
+            alterTable.columnPositions = fluent.columnPositions
+            query = ._alterTable(alterTable)
+        case ._dropTable:
+            let dropTable: MySQLDropTable = .dropTable(fluent.table)
+            query = ._dropTable(dropTable)
         }
+        return conn.query(query).transform(to: ())
     }
-}
-
-extension Array where Element == String {
-    mutating func mysqlShortenNames() throws {
-        for i in 0..<count {
-            try self[i].mysqlShortenName()
-        }
+    
+    /// See `SchemaSupporting`.
+    public static func enableReferences(on conn: MySQLConnection) -> Future<Void> {
+        return conn.future(())
     }
-}
-
-extension SchemaIndex {
-    func mysqlIdentifier(for entity: String) -> String {
-        return "_fluent_index_\(entity)_" + fields.map { $0.name }.joined(separator: "_")
+    
+    /// See `SchemaSupporting`.
+    public static func disableReferences(on conn: MySQLConnection) -> Future<Void> {
+        return conn.future(())
     }
 }
